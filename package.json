@@ -1,0 +1,35 @@
+{
+	"name": "copilot-sdk",
+	"version": "1.0.0",
+	"description": "",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"packageManager": "pnpm@10.28.0",
+	"type": "module",
+	"dependencies": {
+		"@ag-ui/client": "^0.0.43",
+		"@ag-ui/core": "^0.0.43",
+		"@ai-sdk/provider": "^3.0.4",
+		"@ai-sdk/provider-utils": "^4.0.8",
+		"@github/copilot-sdk": "^0.1.12",
+		"@types/cors": "^2.8.19",
+		"@types/express": "^5.0.6",
+		"body-parser": "^2.2.2",
+		"cors": "^2.8.5",
+		"express": "^5.2.1",
+		"rxjs": "^7.8.2",
+		"uuid": "^13.0.0",
+		"zod": "^3.25.76"
+	},
+	"devDependencies": {
+		"@types/body-parser": "^1.19.6",
+		"@types/node": "^24.1.0",
+		"@typescript-eslint/eslint-plugin": "^8.53.0",
+		"globals": "^17.0.0",
+		"typescript-eslint": "^8.53.0"
+	}
+}
