@@ -23,8 +23,10 @@ export class CopilotAgent extends AbstractAgent {
 
 	run(input: RunAgentInput): RunAgent {
 		const { threadId, runId, messages } = input;
-		const userPrompt = messages[messages.length - 1].content as string;
-		console.log("userPrompt", userPrompt);
+		const userPrompt = messages.findLast((msg) => msg.role === "user")?.content; //TODO: handle InputContent[] type
+		const systemMessage = messages.find(
+			(msg) => msg.role === "system",
+		)?.content;
 
 		return new Observable<BaseEvent>((observer) => {
 			observer.next({
@@ -44,7 +46,7 @@ export class CopilotAgent extends AbstractAgent {
 			// 2. Async Execution Logic
 			const execute = async () => {
 				try {
-					currentSession = await this.getSession(threadId);
+					currentSession = await this.getSession({ threadId, systemMessage });
 
 					// Attach Listeners
 					const cleanDeltaEvent = currentSession.on(
@@ -99,10 +101,15 @@ export class CopilotAgent extends AbstractAgent {
 		});
 	}
 
-	private async getSession(
-		threadId: string,
-		model: string = "gpt-4o",
-	): Promise<CopilotSession> {
+	private async getSession({
+		threadId,
+		model,
+		systemMessage = "You are a helpful assistant",
+	}: {
+		threadId: string;
+		model?: string;
+		systemMessage?: string;
+	}): Promise<CopilotSession> {
 		if (this.session) return this.session;
 
 		this.session = await this.client.createSession({
@@ -111,7 +118,7 @@ export class CopilotAgent extends AbstractAgent {
 			streaming: true, // Ensure streaming is enabled!
 			systemMessage: {
 				mode: "replace",
-				content: "You are a helpful assistant.",
+				content: systemMessage,
 			},
 			workingDirectory: "/tmp/copilot/session-state",
 		});
