@@ -1,6 +1,6 @@
 import express from "express";
 import { CopilotAgent } from "./agent.js";
-import { graceFullShutDown } from "./copilot-sdk.js";
+import { client, graceFullShutDown } from "./copilot-sdk.js";
 import { RunErrorEvent } from "@ag-ui/client";
 
 const app = express();
@@ -47,6 +47,29 @@ app.post("/agent", (req, res) => {
 		subscription.unsubscribe();
 		res.end();
 	});
+});
+
+app.delete("/agent/:sessionId", async (req, res) => {
+	const { sessionId } = req.params;
+	try {
+		const sessions = await client.listSessions();
+		for (const session of sessions) {
+			if (session.sessionId === sessionId) {
+				await client.deleteSession(sessionId);
+				res
+					.status(200)
+					.json({ success: true, message: `Session ${sessionId} deleted.` });
+				return;
+			}
+		}
+		res
+			.status(404)
+			.json({ success: false, error: `Session ${sessionId} not found.` });
+	} catch (error: unknown) {
+		const message =
+			error instanceof Error ? error.message : "something went wrong";
+		res.status(500).json({ success: false, error: message });
+	}
 });
 
 const server = app.listen(
