@@ -49,10 +49,29 @@ app.post("/agent", (req, res) => {
 	});
 });
 
+app.delete("/agent/sessions", async (_req, res) => {
+	console.log("clearing all sessions");
+	try {
+		if (client.getState() === "disconnected") await client.start();
+
+		const sessions = await client.listSessions();
+		for (const { sessionId } of sessions) {
+			console.log("deleting session ", sessionId);
+			await client.deleteSession(sessionId);
+		}
+		res.status(200).json({ success: true, message: `All sessions deleted.` });
+	} catch (error: unknown) {
+		console.log("error deleting sessions", error);
+		const message =
+			error instanceof Error ? error.message : "something went wrong";
+		res.status(500).json({ success: false, error: message });
+	}
+});
+
 app.delete("/agent/:sessionId", async (req, res) => {
 	const { sessionId } = req.params;
 	try {
-		await client.start();
+		if (client.getState() === "disconnected") await client.start();
 		const sessions = await client.listSessions();
 		for (const session of sessions) {
 			if (session.sessionId === sessionId) {

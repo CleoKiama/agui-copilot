@@ -65,12 +65,11 @@ export class CopilotAgent extends AbstractAgent {
 					currentSession = await this.getSession({
 						threadId,
 						systemMessage,
-						tools, // Pass AG-UI tools here
-						observer, // Pass observer to emit tool events from handlers
+						tools,
+						observer,
 					});
 
-					// 1. Text Streaming Listener
-					const cleanDeltaEvent = currentSession.on(
+					const unsubDeltaEvent = currentSession.on(
 						"assistant.message_delta",
 						(event) => {
 							observer.next({
@@ -82,23 +81,18 @@ export class CopilotAgent extends AbstractAgent {
 						},
 					);
 
-					// 2. Tool Streaming Listener (Optional: Copilot SDK might handle this via 'assistant.message_delta' too,
-					// but we ensure we catch tool-specific logic if available or via the handler below)
-
-					const offIdleListener = currentSession.on("session.idle", onIdle);
+					const unsubIdleListener = currentSession.on("session.idle", onIdle);
 
 					cleanup = () => {
-						cleanDeltaEvent();
-						offIdleListener();
+						unsubDeltaEvent();
+						unsubIdleListener();
 					};
 
-					// Handle Tool Results from previous turns (if any)
-					// If the last message was a tool result, we might need to feed it back.
-					// However, Copilot SDK usually manages state internally via the session persistence.
-
-					const prompt =
-						userPrompt +
-						(lastToolMsg && `Last tool result received ${lastToolMsg.content}`);
+					let prompt = userPrompt;
+					if (lastToolMsg) {
+						prompt += `Last tool result received ${lastToolMsg.content}`;
+					}
+					console.log("prompt", prompt);
 					await currentSession.send({
 						prompt,
 					});
@@ -118,7 +112,7 @@ export class CopilotAgent extends AbstractAgent {
 			execute();
 			return () => {
 				cleanup?.();
-				void this.destroySession();
+				this.destroySession().catch(console.error);
 			};
 		});
 	}
@@ -149,7 +143,7 @@ export class CopilotAgent extends AbstractAgent {
 						type: EventType.TOOL_CALL_CHUNK,
 						toolCallId: invocation.toolCallId,
 						toolCallName: invocation.toolName,
-						delta: args,
+						delta: JSON.stringify(args),
 					} as ToolCallChunkEvent);
 
 					return {
@@ -161,14 +155,20 @@ export class CopilotAgent extends AbstractAgent {
 			}),
 		);
 
-		await client.start();
+		if (client.getState() === "disconnected") await client.start();
+
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
 
 		// resume existing session if found
 		if (existingSession) {
 			//TODO: might want a way to register new tools when resuming
-			this.session = await this.client.resumeSession(threadId);
+			console.log(
+				`resuming session ${existingSession.sessionId} summary ${existingSession.summary}`,
+			);
+			this.session = await this.client.resumeSession(threadId, {
+				tools: sdkTools,
+			});
 			return this.session;
 		}
 
