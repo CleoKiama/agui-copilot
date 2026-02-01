@@ -10,7 +10,7 @@ app.use(express.json());
 app.post("/agent", (req, res) => {
 	if (!req.accepts("text/event-stream"))
 		return res.status(406).end("Not Acceptable");
-
+	console.log("processing new /agent request with body:");
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -52,6 +52,7 @@ app.post("/agent", (req, res) => {
 app.delete("/agent/:sessionId", async (req, res) => {
 	const { sessionId } = req.params;
 	try {
+		await client.start();
 		const sessions = await client.listSessions();
 		for (const session of sessions) {
 			if (session.sessionId === sessionId) {
