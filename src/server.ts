@@ -28,7 +28,7 @@ app.post("/agent", (req, res) => {
 		},
 		error(error: RunErrorEvent) {
 			console.error(error);
-			res.end(`data: ${JSON.stringify(event)}\n\n`);
+			res.end(`data: ${JSON.stringify(error)}\n\n`);
 		},
 	});
 
