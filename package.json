@@ -24,7 +24,7 @@
 		"rxjs": "^7.8.1",
 		"turbo": "^2.8.0",
 		"uuid": "^13.0.0",
-		"zod": "^3.25.76"
+		"zod": "^4.3.6"
 	},
 	"devDependencies": {
 		"@types/body-parser": "^1.19.6",
