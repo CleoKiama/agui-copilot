@@ -55,7 +55,6 @@ export class CopilotAgent extends AbstractAgent {
 			let cleanup: () => void;
 
 			const onIdle = () => {
-				console.log(`[${runId}] Session idle.`);
 				observer.complete();
 			};
 
@@ -72,12 +71,13 @@ export class CopilotAgent extends AbstractAgent {
 					const unsubDeltaEvent = currentSession.on(
 						"assistant.message_delta",
 						(event) => {
-							observer.next({
+							const message = {
 								type: EventType.TEXT_MESSAGE_CHUNK,
 								messageId: event.data.messageId,
-								deltaContent: event.data.deltaContent,
+								delta: event.data.deltaContent,
 								role: "assistant",
-							} as TextMessageChunkEvent);
+							} satisfies TextMessageChunkEvent;
+							observer.next(message);
 						},
 					);
 
@@ -92,7 +92,7 @@ export class CopilotAgent extends AbstractAgent {
 					if (lastToolMsg) {
 						prompt += `Last tool result received ${lastToolMsg.content}`;
 					}
-					console.log("prompt", prompt);
+
 					await currentSession.send({
 						prompt,
 					});
@@ -130,7 +130,9 @@ export class CopilotAgent extends AbstractAgent {
 		tools?: Tool[];
 		observer: Observer<BaseEvent>;
 	}): Promise<CopilotSession> {
-		if (this.session) return this.session;
+		if (this.session?.sessionId === threadId) {
+			return this.session;
+		}
 
 		// Map AG-UI tools to Copilot SDK tools
 		// defineTool accepts raw JSON Schema in 'parameters'
@@ -161,13 +163,26 @@ export class CopilotAgent extends AbstractAgent {
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
 
 		// resume existing session if found
+
 		if (existingSession) {
-			//TODO: might want a way to register new tools when resuming
-			console.log(
-				`resuming session ${existingSession.sessionId} summary ${existingSession.summary}`,
-			);
 			this.session = await this.client.resumeSession(threadId, {
+				streaming: true,
 				tools: sdkTools,
+				hooks: {
+					onPreToolUse: async (input) => {
+						console.log("tool invocation");
+
+						return {
+							permissionDecision: "allow",
+							modifiedArgs: input.toolArgs,
+							additionalContext:
+								"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
+							suppressOutput: true,
+						};
+					},
+				},
+
+				workingDirectory: "/tmp/copilot/session-state",
 			});
 			return this.session;
 		}
