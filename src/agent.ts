@@ -31,20 +31,29 @@ export class CopilotAgent extends AbstractAgent {
 		const { threadId, runId, messages, tools } = input;
 
 		// Handle generic content or multimodal content array
-		const lastUserMsg = messages.findLast((msg) => msg.role === "user");
-		const userPrompt = Array.isArray(lastUserMsg?.content)
-			? lastUserMsg.content
-					.map((c) => (c.type === "text" ? c.text : ""))
-					.join("") // Simple text extraction
-			: lastUserMsg?.content || "";
+		const lastUserMsg = messages.findLast(
+			(msg) => msg.role === "user" || msg.role === "tool",
+		);
+		let userPrompt = "";
 
-		const lastToolMsg = messages.findLast((msg) => msg.role === "tool");
+		if (lastUserMsg?.role === "tool") {
+			// append latest tool result as context
+			userPrompt = `Tool results with toolCallId  ${lastUserMsg.toolCallId} with result : ${lastUserMsg.content}`;
+		} else if (lastUserMsg?.role === "user") {
+			//todo: handle other message.content types like images
+			userPrompt = Array.isArray(lastUserMsg?.content)
+				? lastUserMsg.content
+						.map((c) => (c.type === "text" ? c.text : ""))
+						.join("")
+				: lastUserMsg?.content || "";
+		}
 
 		const systemMessage = messages.find(
 			(msg) => msg.role === "system",
 		)?.content;
 
 		return new Observable<BaseEvent>((observer) => {
+			//required
 			observer.next({
 				type: EventType.RUN_STARTED,
 				threadId,
@@ -55,6 +64,12 @@ export class CopilotAgent extends AbstractAgent {
 			let cleanup: () => void;
 
 			const onIdle = () => {
+				// required
+				observer.next({
+					type: EventType.RUN_FINISHED,
+					threadId,
+					runId,
+				});
 				observer.complete();
 			};
 
@@ -88,13 +103,8 @@ export class CopilotAgent extends AbstractAgent {
 						unsubIdleListener();
 					};
 
-					let prompt = userPrompt;
-					if (lastToolMsg) {
-						prompt += `Last tool result received ${lastToolMsg.content}`;
-					}
-
 					await currentSession.send({
-						prompt,
+						prompt: userPrompt || "user prompt missing.using default",
 					});
 				} catch (error: unknown) {
 					console.log("Error during agent run execution:", error);
@@ -170,8 +180,6 @@ export class CopilotAgent extends AbstractAgent {
 				tools: sdkTools,
 				hooks: {
 					onPreToolUse: async (input) => {
-						console.log("tool invocation");
-
 						return {
 							permissionDecision: "allow",
 							modifiedArgs: input.toolArgs,
