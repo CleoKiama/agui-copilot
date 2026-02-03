@@ -1,8 +1,9 @@
 import express from "express";
-import { CopilotAgent } from "./agent-chat.js";
+import { CopilotAgent } from "./agents/agent-chat.js";
 import { client, graceFullShutDown } from "./copilot-sdk.js";
 import { RunErrorEvent } from "@ag-ui/client";
-import { HumanInTheLoopAgent } from "./human-in-the-loop.js";
+import { HumanInTheLoopAgent } from "./agents/human-in-the-loop.js";
+import { SharedStateAgent } from "./agents/shared-state.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +62,48 @@ app.post("/agent/human_in_the_loop", (req, res) => {
 	});
 
 	const agent = new HumanInTheLoopAgent();
+	const observable = agent.run(req.body);
+	const subscription = observable.subscribe({
+		next(event) {
+			res.write(`data: ${JSON.stringify(event)}\n\n`);
+		},
+		complete() {
+			res.end();
+		},
+		error(error: RunErrorEvent) {
+			console.error(error);
+			res.end(`data: ${JSON.stringify(error)}\n\n`);
+		},
+	});
+
+	res.on("close", () => {
+		subscription.unsubscribe();
+		console.log("Client connection closed, agent subscription cancelled.");
+	});
+
+	res.on("error", () => {
+		console.log("Response error, cleaning up subscription.");
+		subscription.unsubscribe();
+	});
+
+	req.on("error", (err) => {
+		console.error("Request error:", err);
+		subscription.unsubscribe();
+		res.end();
+	});
+});
+
+app.post("/agent/shared_state", (req, res) => {
+	if (!req.accepts("text/event-stream"))
+		return res.status(406).end("Not Acceptable");
+	console.log("processing new /agent/shared_state request with body");
+	res.writeHead(200, {
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		Connection: "keep-alive",
+	});
+
+	const agent = new SharedStateAgent();
 	const observable = agent.run(req.body);
 	const subscription = observable.subscribe({
 		next(event) {

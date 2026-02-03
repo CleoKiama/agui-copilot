@@ -9,7 +9,8 @@ import {
 	Tool,
 } from "@ag-ui/client";
 import { Observable, Observer } from "rxjs";
-import { client } from "./copilot-sdk.js";
+import { client } from "../copilot-sdk.js";
+import jsonpatch from "fast-json-patch";
 import {
 	defineTool,
 	SessionConfig,
@@ -19,7 +20,7 @@ import {
 
 type RunAgent = Observable<BaseEvent>;
 
-export class CopilotAgent extends AbstractAgent {
+export class SharedStateAgent extends AbstractAgent {
 	client: CopilotClient;
 	private session: CopilotSession | null = null;
 
@@ -29,7 +30,7 @@ export class CopilotAgent extends AbstractAgent {
 	}
 
 	run(input: RunAgentInput): RunAgent {
-		const { threadId, runId, messages, tools } = input;
+		const { threadId, runId, messages, tools, state } = input;
 
 		// Handle generic content or multimodal content array
 		const lastUserMsg = messages.findLast(
@@ -52,6 +53,7 @@ export class CopilotAgent extends AbstractAgent {
 		const systemMessage = messages.find(
 			(msg) => msg.role === "system",
 		)?.content;
+		console.log("systemMessage", systemMessage);
 
 		return new Observable<BaseEvent>((observer) => {
 			//required
@@ -82,6 +84,7 @@ export class CopilotAgent extends AbstractAgent {
 						systemMessage,
 						tools,
 						observer,
+						initialState: state,
 					});
 
 					const unsubDeltaEvent = currentSession.on(
@@ -134,21 +137,26 @@ export class CopilotAgent extends AbstractAgent {
 		systemMessage = "You are a helpful assistant",
 		tools = [],
 		observer,
+		initialState,
 	}: {
 		threadId: string;
 		model?: string;
 		systemMessage?: string;
 		tools?: Tool[];
 		observer: Observer<BaseEvent>;
+		initialState?: RunAgentInput["state"];
 	}): Promise<CopilotSession> {
 		if (this.session?.sessionId === threadId) {
 			return this.session;
 		}
 
+		// Maintain a local reference to state for this run
+		let localState = initialState || {};
+
+		// ensure client connection
 		if (client.getState() === "disconnected") await client.start();
 
 		// Map AG-UI tools to Copilot SDK tools
-		// defineTool accepts raw JSON Schema in 'parameters'
 		const sdkTools = tools.map((tool) =>
 			defineTool(tool.name, {
 				description: tool.description,
@@ -162,7 +170,7 @@ export class CopilotAgent extends AbstractAgent {
 					} as ToolCallChunkEvent);
 
 					return {
-						__agui_tool_call_id: "224335_32234",
+						__agui_tool_call_id: invocation.toolCallId,
 						__agui_status: "PENDING_CLIENT_EXECUTION",
 						message: "Tool call dispatched to client for execution",
 					};
@@ -170,11 +178,57 @@ export class CopilotAgent extends AbstractAgent {
 			}),
 		);
 
-		// Extract common session config for deduplication
+		// Define state tool
+		const stateToolDefinition = {
+			name: "update_state",
+			description:
+				"Update the application state. Provide only the keys you want to change.",
+			parameters: {
+				type: "object",
+				properties: {
+					updates: {
+						type: "object",
+						description: "The partial state object containing updated values.",
+					},
+				},
+				required: ["updates"],
+			},
+		};
+
+		const stateTool = defineTool("update_state", {
+			description: "Updates shared state",
+			parameters: stateToolDefinition.parameters,
+			handler: async ({ updates }: { updates: Record<string, unknown> }) => {
+				console.log("State updates", updates);
+				try {
+					const { compare } = jsonpatch;
+					const newState = { ...localState, ...updates };
+					const delta = compare(localState, newState);
+					console.log("New delta after path delta", delta);
+
+					if (delta.length > 0) {
+						observer.next({
+							type: EventType.STATE_DELTA,
+							delta: delta,
+							timestamp: Date.now(),
+						});
+						localState = newState;
+					}
+					return { success: true, message: "State updated" };
+				} catch (err) {
+					console.error("Error computing state patch:", err);
+					return { success: false, error: "Failed to calculate state patch" };
+				}
+			},
+		});
+
+		// 1. EXTRACT COMMON CONFIGURATION
+		// We use Pick<SessionConfig, ...> to ensure type safety for the properties we are extracting.
+		// This ensures these properties are valid for both createSession and resumeSession.
 		const commonConfig = {
 			streaming: true,
-			workingDirectory: "/tmp",
-			tools: sdkTools,
+			workingDirectory: "/tmp/copilot/session-state",
+			tools: [...sdkTools, stateTool],
 			hooks: {
 				onPreToolUse: async () => {
 					console.log("tool invocation");
@@ -185,13 +239,18 @@ export class CopilotAgent extends AbstractAgent {
 						suppressOutput: true,
 					};
 				},
+				onUserPromptSubmitted: async () => {
+					const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n\n\n`;
+					return {
+						additionalContext: appContext,
+						suppressOutput: true,
+					};
+				},
 			},
 		} satisfies Partial<SessionConfig>;
 
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
-
-		// resume existing session if found
 
 		if (existingSession) {
 			this.session = await this.client.resumeSession(threadId, {
@@ -204,7 +263,11 @@ export class CopilotAgent extends AbstractAgent {
 			...commonConfig,
 			model: model,
 			sessionId: threadId,
-			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
+			availableTools: [
+				...commonConfig.tools.map((t) => t.name),
+				"web_fetch",
+				"ask_user", //use the sdk's as user tool
+			],
 			systemMessage: {
 				mode: "replace",
 				content: systemMessage,
