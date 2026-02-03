@@ -10,6 +10,7 @@ import {
 } from "@ag-ui/client";
 import { Observable, Observer } from "rxjs";
 import { client } from "./copilot-sdk.js";
+import { compare } from "fast-json-patch";
 import {
 	defineTool,
 	type CopilotClient,
@@ -18,7 +19,7 @@ import {
 
 type RunAgent = Observable<BaseEvent>;
 
-export class CopilotAgent extends AbstractAgent {
+export class HumanInTheLoopAgent extends AbstractAgent {
 	client: CopilotClient;
 	private session: CopilotSession | null = null;
 
@@ -28,7 +29,7 @@ export class CopilotAgent extends AbstractAgent {
 	}
 
 	run(input: RunAgentInput): RunAgent {
-		const { threadId, runId, messages, tools } = input;
+		const { threadId, runId, messages, tools, state } = input;
 
 		// Handle generic content or multimodal content array
 		const lastUserMsg = messages.findLast(
@@ -81,6 +82,7 @@ export class CopilotAgent extends AbstractAgent {
 						systemMessage,
 						tools,
 						observer,
+						initialState: state,
 					});
 
 					const unsubDeltaEvent = currentSession.on(
@@ -133,16 +135,23 @@ export class CopilotAgent extends AbstractAgent {
 		systemMessage = "You are a helpful assistant",
 		tools = [],
 		observer,
+		initialState,
 	}: {
 		threadId: string;
 		model?: string;
 		systemMessage?: string;
 		tools?: Tool[];
 		observer: Observer<BaseEvent>;
+		initialState?: RunAgentInput["state"];
 	}): Promise<CopilotSession> {
 		if (this.session?.sessionId === threadId) {
 			return this.session;
 		}
+
+		// Maintain a local reference to state for this run
+		let localState = initialState || {};
+
+		if (client.getState() === "disconnected") await client.start();
 
 		// Map AG-UI tools to Copilot SDK tools
 		// defineTool accepts raw JSON Schema in 'parameters'
@@ -167,17 +176,65 @@ export class CopilotAgent extends AbstractAgent {
 			}),
 		);
 
-		if (client.getState() === "disconnected") await client.start();
-
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
 
 		// resume existing session if found
 
+		const stateToolDefinition = {
+			name: "update_state",
+			description:
+				"Update the application state. Provide only the keys you want to change.",
+			parameters: {
+				type: "object",
+				properties: {
+					updates: {
+						type: "object",
+						description: "The partial state object containing updated values.",
+					},
+				},
+				required: ["updates"],
+			},
+		};
+		const stateTool = defineTool("update_state", {
+			description: "Updates shared state",
+			parameters: stateToolDefinition.parameters, // standard JSON schema
+			handler: async ({ updates }: { updates: Record<string, unknown> }) => {
+				console.log("State updates", updates);
+				try {
+					// 1. Compute new state (Merge strategy)
+					// This handles simple top-level merges. For deep merges, use lodash.merge or similar.
+					const newState = { ...localState, ...updates };
+
+					// 2. Compute the RFC 6902 Patch
+					// 'compare' generates: [{ op: "replace", path: "/key", value: "newVal" }]
+					const delta = compare(localState, newState);
+					console.log("New delta after path delta", delta);
+
+					// 3. Emit the AG-UI Standard Event
+					if (delta.length > 0) {
+						observer.next({
+							type: EventType.STATE_DELTA,
+							delta: delta,
+							timestamp: Date.now(),
+						});
+
+						// 4. Update local reference for subsequent tool calls in this same run
+						localState = newState;
+					}
+
+					return { success: true, message: "State updated" };
+				} catch (err) {
+					console.error("Error computing state patch:", err);
+					return { success: false, error: "Failed to calculate state patch" };
+				}
+			},
+		});
+
 		if (existingSession) {
 			this.session = await this.client.resumeSession(threadId, {
 				streaming: true,
-				tools: sdkTools,
+				tools: [...sdkTools, stateTool],
 				hooks: {
 					onPreToolUse: async (input) => {
 						return {
@@ -188,8 +245,14 @@ export class CopilotAgent extends AbstractAgent {
 							suppressOutput: true,
 						};
 					},
+					onUserPromptSubmitted: async () => {
+						console.log("User input submited injecting application context");
+						return {
+							additionalContext: `\n\n<ApplicationCurrentStateSnapshot>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationCurrentStateSnapshot>\n\n`,
+							suppressOutput: true,
+						};
+					},
 				},
-
 				workingDirectory: "/tmp/copilot/session-state",
 			});
 			return this.session;
@@ -199,7 +262,13 @@ export class CopilotAgent extends AbstractAgent {
 			model: model,
 			sessionId: threadId,
 			streaming: true,
-			tools: sdkTools, // Inject mapped tools
+			tools: [...sdkTools, stateTool],
+			availableTools: [
+				...sdkTools.map((t) => t.name),
+				"web_fetch",
+				"ask_user",
+				"update_state",
+			],
 			hooks: {
 				onPreToolUse: async (input) => {
 					console.log("tool invocation");
@@ -209,6 +278,13 @@ export class CopilotAgent extends AbstractAgent {
 						modifiedArgs: input.toolArgs,
 						additionalContext:
 							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
+						suppressOutput: true,
+					};
+				},
+				onUserPromptSubmitted: async () => {
+					console.log("User input submited injecting application context");
+					return {
+						additionalContext: `\n\n<ApplicationCurrentStateSnapshot>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationCurrentStateSnapshot>\n\n`,
 						suppressOutput: true,
 					};
 				},
