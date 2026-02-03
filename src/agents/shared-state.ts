@@ -335,6 +335,7 @@ SYSTEM INSTRUCTIONS FOR STATE MANAGEMENT:
 - After using update_state, respond with a brief summary only.
 - The <ApplicationContext> provided is for your reference only.
 - When changing state, use the "update_state" tool with JSON Patch operations (RFC 6902).
+- Aways keep the state in sync with the frontend after sending updates.
 - ONLY send the minimal operations needed. NEVER reconstruct or send the full state.
 
 CORRECT EXAMPLES:
@@ -350,8 +351,8 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
 `;
 		this.session = await this.client.createSession({
 			...commonConfig,
-			// model: model || "gpt-4.1",
-			model: model || "gpt-5-mini",
+			model: model || "gpt-4.1",
+			// model: model || "gpt-5-mini",
 			sessionId: threadId,
 			availableTools: [
 				...commonConfig.tools.map((t) => t.name),
