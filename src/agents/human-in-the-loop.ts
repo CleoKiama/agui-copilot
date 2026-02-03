@@ -220,6 +220,7 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 
 	private async destroySession() {
 		if (this.session) {
+			await this.session.abort();
 			this.session.destroy();
 			this.session = null;
 		}
