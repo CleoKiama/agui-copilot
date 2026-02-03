@@ -182,13 +182,14 @@ export class SharedStateAgent extends AbstractAgent {
 		const stateToolDefinition = {
 			name: "update_state",
 			description:
-				"Update the application state. Provide only the keys you want to change.",
+				"REQUIRED: Update the shared state. ONLY provide the properties that have changed. Do not send back the full state.",
 			parameters: {
 				type: "object",
 				properties: {
 					updates: {
 						type: "object",
-						description: "The partial state object containing updated values.",
+						description:
+							"Map of paths to new values. For deep changes, use dot-notation (e.g., {'recipe.title': 'New Name'} or {'recipe.ingredients.0.amount': '2 cups'}).",
 					},
 				},
 				required: ["updates"],
@@ -196,10 +197,13 @@ export class SharedStateAgent extends AbstractAgent {
 		};
 
 		const stateTool = defineTool("update_state", {
-			description: "Updates shared state",
+			description:
+				"Updates shared state.You must Use this to update the shared state for the application and keep it in sync as the user expects.",
 			parameters: stateToolDefinition.parameters,
-			handler: async ({ updates }: { updates: Record<string, unknown> }) => {
-				console.log("State updates", updates);
+			handler: async (args: Record<string, unknown>) => {
+				console.log("Raw Tool Arguments:", JSON.stringify(args, null, 2));
+				const updates = args.updates || args;
+
 				try {
 					const { compare } = jsonpatch;
 					const newState = { ...localState, ...updates };
@@ -225,9 +229,10 @@ export class SharedStateAgent extends AbstractAgent {
 		// 1. EXTRACT COMMON CONFIGURATION
 		// We use Pick<SessionConfig, ...> to ensure type safety for the properties we are extracting.
 		// This ensures these properties are valid for both createSession and resumeSession.
+
 		const commonConfig = {
 			streaming: true,
-			workingDirectory: "/tmp/copilot/session-state",
+			workingDirectory: "/tmp",
 			tools: [...sdkTools, stateTool],
 			hooks: {
 				onPreToolUse: async () => {
@@ -239,10 +244,12 @@ export class SharedStateAgent extends AbstractAgent {
 						suppressOutput: true,
 					};
 				},
-				onUserPromptSubmitted: async () => {
-					const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n\n\n`;
+				onUserPromptSubmitted: async (input) => {
+					const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationContext>  \n\n`;
+
 					return {
-						additionalContext: appContext,
+						modifiedPrompt: `${input.prompt}\n${appContext}`,
+						// additionalContext: appContext,
 						suppressOutput: true,
 					};
 				},
@@ -259,18 +266,28 @@ export class SharedStateAgent extends AbstractAgent {
 			return this.session;
 		}
 
+		const stateDirectives = `
+                   SYSTEM INSTRUCTIONS:
+                   - The Front-end is the SOURCE OF TRUTH for the application state.
+                   - The <ApplicationContext> provided is for your reference only.
+                   - When changing the state via "update_state", you MUST ONLY include the specific keys/properties that are being modified or added.
+                   - DO NOT reconstruct the entire state object. 
+                   - DO NOT include unchanged fields from the <ApplicationContext>.
+                   - Example: If the user only wants to change the title, your "updates" object should ONLY contain the "title" key, not the ingredients or instructions.
+                   - If adding an item to a list, send the updated list with the new item included, but keep all other top-level keys out of the call.
+                   `;
 		this.session = await this.client.createSession({
 			...commonConfig,
-			model: model,
+			model: model || "gpt-5-mini",
 			sessionId: threadId,
 			availableTools: [
 				...commonConfig.tools.map((t) => t.name),
 				"web_fetch",
-				"ask_user", //use the sdk's as user tool
+				"ask_user",
 			],
 			systemMessage: {
 				mode: "replace",
-				content: systemMessage,
+				content: systemMessage + stateDirectives,
 			},
 		});
 
