@@ -10,7 +10,7 @@ import {
 } from "@ag-ui/client";
 import { Observable, Observer } from "rxjs";
 import { client } from "./copilot-sdk.js";
-import { compare } from "fast-json-patch";
+import jsonpatch from "fast-json-patch";
 import {
 	defineTool,
 	SessionConfig,
@@ -200,6 +200,7 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 			handler: async ({ updates }: { updates: Record<string, unknown> }) => {
 				console.log("State updates", updates);
 				try {
+					const { compare } = jsonpatch;
 					const newState = { ...localState, ...updates };
 					const delta = compare(localState, newState);
 					console.log("New delta after path delta", delta);
