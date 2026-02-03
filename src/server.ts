@@ -12,7 +12,7 @@ app.use(express.json());
 app.post("/agent/agentic_chat", (req, res) => {
 	if (!req.accepts("text/event-stream"))
 		return res.status(406).end("Not Acceptable");
-	console.log("processing new /agent request with body");
+	console.log("processing request at /agent/agentic_chat");
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -54,7 +54,7 @@ app.post("/agent/agentic_chat", (req, res) => {
 app.post("/agent/human_in_the_loop", (req, res) => {
 	if (!req.accepts("text/event-stream"))
 		return res.status(406).end("Not Acceptable");
-	console.log("processing new /agent request with body");
+	console.log("request received at /agent/human_in_the_loop");
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -96,7 +96,7 @@ app.post("/agent/human_in_the_loop", (req, res) => {
 app.post("/agent/shared_state", (req, res) => {
 	if (!req.accepts("text/event-stream"))
 		return res.status(406).end("Not Acceptable");
-	console.log("processing new /agent/shared_state request with body");
+	console.log("request received at /agent/shared_state");
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",

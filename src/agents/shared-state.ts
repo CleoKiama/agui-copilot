@@ -226,10 +226,6 @@ export class SharedStateAgent extends AbstractAgent {
 			},
 		});
 
-		// 1. EXTRACT COMMON CONFIGURATION
-		// We use Pick<SessionConfig, ...> to ensure type safety for the properties we are extracting.
-		// This ensures these properties are valid for both createSession and resumeSession.
-
 		const commonConfig = {
 			streaming: true,
 			workingDirectory: "/tmp",
