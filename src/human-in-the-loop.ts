@@ -13,6 +13,7 @@ import { client } from "./copilot-sdk.js";
 import { compare } from "fast-json-patch";
 import {
 	defineTool,
+	SessionConfig,
 	type CopilotClient,
 	type CopilotSession,
 } from "@github/copilot-sdk";
@@ -151,10 +152,10 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 		// Maintain a local reference to state for this run
 		let localState = initialState || {};
 
+		// ensure client connection
 		if (client.getState() === "disconnected") await client.start();
 
 		// Map AG-UI tools to Copilot SDK tools
-		// defineTool accepts raw JSON Schema in 'parameters'
 		const sdkTools = tools.map((tool) =>
 			defineTool(tool.name, {
 				description: tool.description,
@@ -176,11 +177,7 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 			}),
 		);
 
-		const sessions = await this.client.listSessions();
-		const existingSession = sessions.find((s) => s.sessionId === threadId);
-
-		// resume existing session if found
-
+		// Define state tool
 		const stateToolDefinition = {
 			name: "update_state",
 			description:
@@ -196,33 +193,25 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 				required: ["updates"],
 			},
 		};
+
 		const stateTool = defineTool("update_state", {
 			description: "Updates shared state",
-			parameters: stateToolDefinition.parameters, // standard JSON schema
+			parameters: stateToolDefinition.parameters,
 			handler: async ({ updates }: { updates: Record<string, unknown> }) => {
 				console.log("State updates", updates);
 				try {
-					// 1. Compute new state (Merge strategy)
-					// This handles simple top-level merges. For deep merges, use lodash.merge or similar.
 					const newState = { ...localState, ...updates };
-
-					// 2. Compute the RFC 6902 Patch
-					// 'compare' generates: [{ op: "replace", path: "/key", value: "newVal" }]
 					const delta = compare(localState, newState);
 					console.log("New delta after path delta", delta);
 
-					// 3. Emit the AG-UI Standard Event
 					if (delta.length > 0) {
 						observer.next({
 							type: EventType.STATE_DELTA,
 							delta: delta,
 							timestamp: Date.now(),
 						});
-
-						// 4. Update local reference for subsequent tool calls in this same run
 						localState = newState;
 					}
-
 					return { success: true, message: "State updated" };
 				} catch (err) {
 					console.error("Error computing state patch:", err);
@@ -231,69 +220,56 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 			},
 		});
 
-		if (existingSession) {
-			this.session = await this.client.resumeSession(threadId, {
-				streaming: true,
-				tools: [...sdkTools, stateTool],
-				hooks: {
-					onPreToolUse: async (input) => {
-						return {
-							permissionDecision: "allow",
-							modifiedArgs: input.toolArgs,
-							additionalContext:
-								"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
-							suppressOutput: true,
-						};
-					},
-					onUserPromptSubmitted: async () => {
-						console.log("User input submited injecting application context");
-						return {
-							additionalContext: `\n\n<ApplicationCurrentStateSnapshot>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationCurrentStateSnapshot>\n\n`,
-							suppressOutput: true,
-						};
-					},
-				},
-				workingDirectory: "/tmp/copilot/session-state",
-			});
-			return this.session;
-		}
-
-		this.session = await this.client.createSession({
-			model: model,
-			sessionId: threadId,
+		// 1. EXTRACT COMMON CONFIGURATION
+		// We use Pick<SessionConfig, ...> to ensure type safety for the properties we are extracting.
+		// This ensures these properties are valid for both createSession and resumeSession.
+		const commonConfig = {
 			streaming: true,
+			workingDirectory: "/tmp/copilot/session-state",
 			tools: [...sdkTools, stateTool],
-			availableTools: [
-				...sdkTools.map((t) => t.name),
-				"web_fetch",
-				"ask_user",
-				"update_state",
-			],
 			hooks: {
-				onPreToolUse: async (input) => {
+				onPreToolUse: async () => {
 					console.log("tool invocation");
-
 					return {
 						permissionDecision: "allow",
-						modifiedArgs: input.toolArgs,
 						additionalContext:
 							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
 						suppressOutput: true,
 					};
 				},
 				onUserPromptSubmitted: async () => {
-					console.log("User input submited injecting application context");
+					console.log("User input submitted injecting application context");
 					return {
-						additionalContext: `\n\n<ApplicationCurrentStateSnapshot>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationCurrentStateSnapshot>\n\n`,
+						additionalContext: `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n\n\n`,
 						suppressOutput: true,
 					};
 				},
 			},
+		} satisfies Partial<SessionConfig>;
+
+		const sessions = await this.client.listSessions();
+		const existingSession = sessions.find((s) => s.sessionId === threadId);
+
+		if (existingSession) {
+			this.session = await this.client.resumeSession(threadId, {
+				...commonConfig,
+			});
+			return this.session;
+		}
+
+		this.session = await this.client.createSession({
+			...commonConfig,
+			model: model,
+			sessionId: threadId,
+			availableTools: [
+				...commonConfig.tools.map((t) => t.name),
+				"web_fetch",
+				"ask_user", //use the sdk's as user tool
+			],
 			systemMessage: {
 				mode: "replace",
 				content: systemMessage,
 			},
-			workingDirectory: "/tmp/copilot/session-state",
 		});
 
 		return this.session;

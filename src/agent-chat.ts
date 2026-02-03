@@ -12,6 +12,7 @@ import { Observable, Observer } from "rxjs";
 import { client } from "./copilot-sdk.js";
 import {
 	defineTool,
+	SessionConfig,
 	type CopilotClient,
 	type CopilotSession,
 } from "@github/copilot-sdk";
@@ -144,6 +145,8 @@ export class CopilotAgent extends AbstractAgent {
 			return this.session;
 		}
 
+		if (client.getState() === "disconnected") await client.start();
+
 		// Map AG-UI tools to Copilot SDK tools
 		// defineTool accepts raw JSON Schema in 'parameters'
 		const sdkTools = tools.map((tool) =>
@@ -167,7 +170,23 @@ export class CopilotAgent extends AbstractAgent {
 			}),
 		);
 
-		if (client.getState() === "disconnected") await client.start();
+		// Extract common session config for deduplication
+		const commonConfig = {
+			streaming: true,
+			workingDirectory: "/tmp",
+			tools: sdkTools,
+			hooks: {
+				onPreToolUse: async () => {
+					console.log("tool invocation");
+					return {
+						permissionDecision: "allow",
+						additionalContext:
+							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
+						suppressOutput: true,
+					};
+				},
+			},
+		} satisfies Partial<SessionConfig>;
 
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
@@ -176,49 +195,20 @@ export class CopilotAgent extends AbstractAgent {
 
 		if (existingSession) {
 			this.session = await this.client.resumeSession(threadId, {
-				streaming: true,
-				tools: sdkTools,
-				hooks: {
-					onPreToolUse: async (input) => {
-						return {
-							permissionDecision: "allow",
-							modifiedArgs: input.toolArgs,
-							additionalContext:
-								"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
-							suppressOutput: true,
-						};
-					},
-				},
-
-				workingDirectory: "/tmp",
+				...commonConfig,
 			});
 			return this.session;
 		}
 
 		this.session = await this.client.createSession({
+			...commonConfig,
 			model: model,
 			sessionId: threadId,
-			streaming: true,
-			tools: sdkTools,
 			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
-			hooks: {
-				onPreToolUse: async (input) => {
-					console.log("tool invocation");
-
-					return {
-						permissionDecision: "allow",
-						modifiedArgs: input.toolArgs,
-						additionalContext:
-							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
-						suppressOutput: true,
-					};
-				},
-			},
 			systemMessage: {
 				mode: "replace",
 				content: systemMessage,
 			},
-			workingDirectory: "/tmp",
 		});
 
 		return this.session;

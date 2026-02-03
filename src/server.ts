@@ -1,5 +1,5 @@
 import express from "express";
-import { CopilotAgentChat } from "./agent-chat.js";
+import { CopilotAgent } from "./agent-chat.js";
 import { client, graceFullShutDown } from "./copilot-sdk.js";
 import { RunErrorEvent } from "@ag-ui/client";
 import { HumanInTheLoopAgent } from "./human-in-the-loop.js";
@@ -18,7 +18,7 @@ app.post("/agent/agentic_chat", (req, res) => {
 		Connection: "keep-alive",
 	});
 
-	const agent = new CopilotAgentChat();
+	const agent = new CopilotAgent();
 	const observable = agent.run(req.body);
 	const subscription = observable.subscribe({
 		next(event) {
@@ -50,7 +50,7 @@ app.post("/agent/agentic_chat", (req, res) => {
 	});
 });
 
-app.post("/agent/human-in-the-loop", (req, res) => {
+app.post("/agent/human_in_the_loop", (req, res) => {
 	if (!req.accepts("text/event-stream"))
 		return res.status(406).end("Not Acceptable");
 	console.log("processing new /agent request with body");
