@@ -178,50 +178,117 @@ export class SharedStateAgent extends AbstractAgent {
 			}),
 		);
 
-		// Define state tool
+		// Define state tool with JSON Patch (RFC 6902) format
 		const stateToolDefinition = {
 			name: "update_state",
 			description:
-				"REQUIRED: Update the shared state. ONLY provide the properties that have changed. Do not send back the full state.",
+				"Apply changes to the shared application state using JSON Patch operations (RFC 6902). Only send the specific operations needed - never the full state.",
 			parameters: {
 				type: "object",
 				properties: {
-					updates: {
-						type: "object",
-						description:
-							"Map of paths to new values. For deep changes, use dot-notation (e.g., {'recipe.title': 'New Name'} or {'recipe.ingredients.0.amount': '2 cups'}).",
+					operations: {
+						type: "array",
+						description: "JSON Patch operations to apply",
+						items: {
+							type: "object",
+							properties: {
+								op: {
+									type: "string",
+									enum: ["add", "remove", "replace"],
+									description: "The operation type",
+								},
+								path: {
+									type: "string",
+									description:
+										"JSON Pointer path to the target location (e.g., '/recipe/title', '/recipe/ingredients/0/amount')",
+								},
+								value: {
+									description:
+										"The value to add or replace (required for 'add' and 'replace' operations)",
+								},
+							},
+							required: ["op", "path"],
+						},
 					},
 				},
-				required: ["updates"],
+				required: ["operations"],
 			},
 		};
 
 		const stateTool = defineTool("update_state", {
-			description:
-				"Updates shared state.You must Use this to update the shared state for the application and keep it in sync as the user expects.",
+			description: stateToolDefinition.description,
 			parameters: stateToolDefinition.parameters,
-			handler: async (args: Record<string, unknown>) => {
+			handler: async (args: { operations?: jsonpatch.Operation[] }) => {
 				console.log("Raw Tool Arguments:", JSON.stringify(args, null, 2));
-				const updates = args.updates || args;
 
 				try {
-					const { compare } = jsonpatch;
-					const newState = { ...localState, ...updates };
-					const delta = compare(localState, newState);
-					console.log("New delta after path delta", delta);
+					const operations = args.operations;
+					console.log("operations", operations);
 
-					if (delta.length > 0) {
-						observer.next({
-							type: EventType.STATE_DELTA,
-							delta: delta,
-							timestamp: Date.now(),
-						});
-						localState = newState;
+					if (
+						!operations ||
+						!Array.isArray(operations) ||
+						operations.length === 0
+					) {
+						console.warn("No valid operations provided to update_state");
+						return {
+							success: false,
+							error:
+								"No valid operations provided. Expected an array of JSON Patch operations.",
+						};
 					}
-					return { success: true, message: "State updated" };
+
+					// Validate operations have required fields
+					for (const op of operations) {
+						if (!op.op || !op.path) {
+							console.warn("Invalid operation:", op);
+							return {
+								success: false,
+								error: `Invalid operation: each operation must have 'op' and 'path' fields`,
+							};
+						}
+						if (
+							(op.op === "add" || op.op === "replace") &&
+							op.value === undefined
+						) {
+							console.warn("Missing value for add/replace operation:", op);
+							return {
+								success: false,
+								error: `Operation '${op.op}' requires a 'value' field`,
+							};
+						}
+					}
+
+					console.log("Applying JSON Patch operations:", operations);
+
+					// Apply patches directly to local state
+					const result = jsonpatch.applyPatch(
+						localState,
+						operations,
+						true,
+						false,
+					);
+					localState = result.newDocument;
+
+					// Forward the operations as the delta to the frontend
+					observer.next({
+						type: EventType.STATE_DELTA,
+						delta: operations,
+						timestamp: Date.now(),
+					});
+
+					return {
+						success: true,
+						message: `Applied ${operations.length} operation(s)`,
+					};
 				} catch (err) {
-					console.error("Error computing state patch:", err);
-					return { success: false, error: "Failed to calculate state patch" };
+					console.error("Error applying state patch:", err);
+					const errorMessage =
+						err instanceof Error ? err.message : "Unknown error";
+					return {
+						success: false,
+						error: `Failed to apply state patch: ${errorMessage}`,
+					};
 				}
 			},
 		});
@@ -263,17 +330,27 @@ export class SharedStateAgent extends AbstractAgent {
 		}
 
 		const stateDirectives = `
-                   SYSTEM INSTRUCTIONS:
-                   - The Front-end is the SOURCE OF TRUTH for the application state.
-                   - The <ApplicationContext> provided is for your reference only.
-                   - When changing the state via "update_state", you MUST ONLY include the specific keys/properties that are being modified or added.
-                   - DO NOT reconstruct the entire state object. 
-                   - DO NOT include unchanged fields from the <ApplicationContext>.
-                   - Example: If the user only wants to change the title, your "updates" object should ONLY contain the "title" key, not the ingredients or instructions.
-                   - If adding an item to a list, send the updated list with the new item included, but keep all other top-level keys out of the call.
-                   `;
+SYSTEM INSTRUCTIONS FOR STATE MANAGEMENT:
+- The Front-end is the SOURCE OF TRUTH for the application state.
+- After using update_state, respond with a brief summary only.
+- The <ApplicationContext> provided is for your reference only.
+- When changing state, use the "update_state" tool with JSON Patch operations (RFC 6902).
+- ONLY send the minimal operations needed. NEVER reconstruct or send the full state.
+
+CORRECT EXAMPLES:
+- Change title: update_state({ "operations": [{ "op": "replace", "path": "/recipe/title", "value": "New Title" }] })
+- Change ingredient amount: update_state({ "operations": [{ "op": "replace", "path": "/recipe/ingredients/0/amount", "value": "3 cups" }] })
+- Add new ingredient: update_state({ "operations": [{ "op": "add", "path": "/recipe/ingredients/-", "value": { "name": "Salt", "amount": "1 tsp" } }] })
+- Remove an item: update_state({ "operations": [{ "op": "remove", "path": "/recipe/ingredients/2" }] })
+- Multiple changes: update_state({ "operations": [{ "op": "replace", "path": "/recipe/title", "value": "New" }, { "op": "replace", "path": "/recipe/cooking_time", "value": "30 min" }] })
+
+INCORRECT (wastes tokens - DO NOT DO THIS):
+- Sending the entire recipe object when only the title changed
+- Including unchanged fields in your operations
+`;
 		this.session = await this.client.createSession({
 			...commonConfig,
+			// model: model || "gpt-4.1",
 			model: model || "gpt-5-mini",
 			sessionId: threadId,
 			availableTools: [

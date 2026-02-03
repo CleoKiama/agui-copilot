@@ -1,6 +1,7 @@
 import { CopilotClient } from "@github/copilot-sdk";
 
 const client = new CopilotClient({
+	logLevel: "info",
 	cliUrl: "localhost:4321",
 });
 
