@@ -293,42 +293,6 @@ export class SharedStateAgent extends AbstractAgent {
 			},
 		});
 
-		const commonConfig = {
-			streaming: true,
-			workingDirectory: "/tmp",
-			tools: [...sdkTools, stateTool],
-			hooks: {
-				onPreToolUse: async () => {
-					console.log("tool invocation");
-					return {
-						permissionDecision: "allow",
-						additionalContext:
-							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
-						suppressOutput: true,
-					};
-				},
-				onUserPromptSubmitted: async (input) => {
-					const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationContext>  \n\n`;
-
-					return {
-						modifiedPrompt: `${input.prompt}\n${appContext}`,
-						// additionalContext: appContext,
-						suppressOutput: true,
-					};
-				},
-			},
-		} satisfies Partial<SessionConfig>;
-
-		const sessions = await this.client.listSessions();
-		const existingSession = sessions.find((s) => s.sessionId === threadId);
-
-		if (existingSession) {
-			this.session = await this.client.resumeSession(threadId, {
-				...commonConfig,
-			});
-			return this.session;
-		}
-
 		const stateDirectives = `
 SYSTEM INSTRUCTIONS FOR STATE MANAGEMENT:
 - The Front-end is the SOURCE OF TRUTH for the application state.
@@ -349,20 +313,54 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
 - Sending the entire recipe object when only the title changed
 - Including unchanged fields in your operations
 `;
-		this.session = await this.client.createSession({
-			...commonConfig,
+
+		// Extract common session config for deduplication
+		const commonConfig = {
 			model: model || "gpt-4.1",
-			// model: model || "gpt-5-mini",
+			streaming: true,
 			sessionId: threadId,
-			availableTools: [
-				...commonConfig.tools.map((t) => t.name),
-				"web_fetch",
-				"ask_user",
-			],
+			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user", "update_state"],
+			workingDirectory: "/tmp",
+			tools: [...sdkTools, stateTool],
 			systemMessage: {
 				mode: "replace",
 				content: systemMessage + stateDirectives,
 			},
+			hooks: {
+				onPreToolUse: async () => {
+					console.log("tool invocation");
+					return {
+						permissionDecision: "allow",
+						additionalContext:
+							"Tool results will be executed on the frontend and results returned as part of your context conversation in the later messages.",
+						suppressOutput: true,
+					};
+				},
+				onUserPromptSubmitted: async (input) => {
+					const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationContext>  \n\n`;
+
+					return {
+						modifiedPrompt: `${input.prompt}\n${appContext}`,
+						suppressOutput: true,
+					};
+				},
+			},
+		} satisfies Partial<SessionConfig>;
+
+		const sessions = await this.client.listSessions();
+		const existingSession = sessions.find((s) => s.sessionId === threadId);
+
+		// resume existing session if found
+
+		if (existingSession) {
+			this.session = await this.client.resumeSession(threadId, {
+				...commonConfig,
+			});
+			return this.session;
+		}
+
+		this.session = await this.client.createSession({
+			...commonConfig,
 		});
 
 		return this.session;

@@ -172,9 +172,16 @@ export class CopilotAgent extends AbstractAgent {
 
 		// Extract common session config for deduplication
 		const commonConfig = {
+			model: model,
 			streaming: true,
+			sessionId: threadId,
+			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
 			workingDirectory: "/tmp",
 			tools: sdkTools,
+			systemMessage: {
+				mode: "replace",
+				content: systemMessage,
+			},
 			hooks: {
 				onPreToolUse: async () => {
 					console.log("tool invocation");
@@ -202,13 +209,6 @@ export class CopilotAgent extends AbstractAgent {
 
 		this.session = await this.client.createSession({
 			...commonConfig,
-			model: model,
-			sessionId: threadId,
-			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
-			systemMessage: {
-				mode: "replace",
-				content: systemMessage,
-			},
 		});
 
 		return this.session;

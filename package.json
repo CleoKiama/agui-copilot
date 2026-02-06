@@ -3,7 +3,8 @@
 	"version": "1.0.0",
 	"description": "",
 	"scripts": {
-		"dev": "tsx watch src/server.ts"
+		"dev": "tsx watch src/server.ts",
+		"play": "dotenv tsx ./play.ts"
 	},
 	"keywords": [],
 	"author": "",
@@ -15,11 +16,11 @@
 		"@ag-ui/core": "^0.0.43",
 		"@ai-sdk/provider": "^3.0.4",
 		"@ai-sdk/provider-utils": "^4.0.8",
-		"@github/copilot-sdk": "^0.1.20",
 		"@types/cors": "^2.8.19",
 		"@types/express": "^5.0.6",
 		"body-parser": "^2.2.2",
 		"cors": "^2.8.5",
+		"dotenv": "^17.2.3",
 		"express": "^5.2.1",
 		"fast-json-patch": "^3.1.1",
 		"rxjs": "^7.8.1",

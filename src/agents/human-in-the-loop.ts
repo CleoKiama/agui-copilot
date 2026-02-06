@@ -170,13 +170,18 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 			}),
 		);
 
-		// 1. EXTRACT COMMON CONFIGURATION
-		// We use Pick<SessionConfig, ...> to ensure type safety for the properties we are extracting.
-		// This ensures these properties are valid for both createSession and resumeSession.
+		// Extract common session config for deduplication
 		const commonConfig = {
+			model: model,
 			streaming: true,
+			sessionId: threadId,
+			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
 			workingDirectory: "/tmp/copilot/session-state",
 			tools: sdkTools,
+			systemMessage: {
+				mode: "replace",
+				content: systemMessage,
+			},
 			hooks: {
 				onPreToolUse: async () => {
 					console.log("tool invocation");
@@ -193,6 +198,8 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
 
+		// resume existing session if found
+
 		if (existingSession) {
 			this.session = await this.client.resumeSession(threadId, {
 				...commonConfig,
@@ -202,17 +209,6 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 
 		this.session = await this.client.createSession({
 			...commonConfig,
-			model: model,
-			sessionId: threadId,
-			availableTools: [
-				...commonConfig.tools.map((t) => t.name),
-				"web_fetch",
-				"ask_user", //use the sdk's as user tool
-			],
-			systemMessage: {
-				mode: "replace",
-				content: systemMessage,
-			},
 		});
 
 		return this.session;
