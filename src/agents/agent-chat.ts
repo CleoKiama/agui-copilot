@@ -172,9 +172,11 @@ export class CopilotAgent extends AbstractAgent {
 
 		// Extract common session config for deduplication
 		const commonConfig = {
-			model: model,
+			// model: model || "gpt-4.1",
+			model: model || "gpt-5-mini",
 			streaming: true,
 			sessionId: threadId,
+			reasoningEffort: "medium",
 			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
 			workingDirectory: "/tmp",
 			tools: sdkTools,

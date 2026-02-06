@@ -316,10 +316,16 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
 
 		// Extract common session config for deduplication
 		const commonConfig = {
-			model: model || "gpt-4.1",
+			model: model || "gpt-5-mini",
 			streaming: true,
 			sessionId: threadId,
-			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user", "update_state"],
+			reasoningEffort: "medium",
+			availableTools: [
+				...sdkTools.map((t) => t.name),
+				"web_fetch",
+				"ask_user",
+				"update_state",
+			],
 			workingDirectory: "/tmp",
 			tools: [...sdkTools, stateTool],
 			systemMessage: {
