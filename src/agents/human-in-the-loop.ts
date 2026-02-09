@@ -172,9 +172,9 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 
 		// Extract common session config for deduplication
 		const commonConfig = {
-			// model: model || "gpt-4.1",
-			model: model || "gpt-5-mini",
-			reasoningEffort: "medium",
+			model: model || "gpt-4.1",
+			// model: model || "gpt-5-mini",
+			// reasoningEffort: "medium",
 			streaming: true,
 			sessionId: threadId,
 			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
