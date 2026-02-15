@@ -19,9 +19,41 @@ import {
 
 type RunAgent = Observable<BaseEvent>;
 
+/**
+ * Module-level map of pending tool calls.
+ * Key: toolCallId
+ * Value: { resolve } to unblock the Copilot SDK tool handler when the client
+ *        sends back the tool result in a subsequent HTTP request.
+ *
+ * This must live at module scope because HumanInTheLoopAgent is instantiated
+ * per request in server.ts, but the blocked Promise from Request 1 needs to
+ * be resolved by Request 2.
+ */
+const pendingToolCalls = new Map<
+	string,
+	{ resolve: (result: string) => void }
+>();
+
+/**
+ * Module-level session cache keyed by threadId.
+ * Keeps the CopilotSession alive across requests so the blocked tool handler
+ * Promise can be resolved by a later request.
+ */
+const sessionCache = new Map<string, CopilotSession>();
+
+/**
+ * Module-level mutable reference to the current observer + runId for each thread.
+ * Updated on every request so that tool handlers (which are created once per session
+ * but may fire across multiple requests) always emit events on the correct,
+ * currently-active SSE stream.
+ */
+const activeObservers = new Map<
+	string,
+	{ observer: Observer<BaseEvent>; runId: string }
+>();
+
 export class HumanInTheLoopAgent extends AbstractAgent {
 	client: CopilotClient;
-	private session: CopilotSession | null = null;
 
 	constructor() {
 		super();
@@ -31,17 +63,16 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 	run(input: RunAgentInput): RunAgent {
 		const { threadId, runId, messages, tools } = input;
 
-		// Handle generic content or multimodal content array
 		const lastUserMsg = messages.findLast(
 			(msg) => msg.role === "user" || msg.role === "tool",
 		);
+
+		// Check if this request is delivering tool results
+		const isToolResultRequest = lastUserMsg?.role === "tool";
+
 		let userPrompt = "";
 
-		if (lastUserMsg?.role === "tool") {
-			// append latest tool result as context
-			userPrompt = `Tool results with toolCallId  ${lastUserMsg.toolCallId} with result : ${lastUserMsg.content}`;
-		} else if (lastUserMsg?.role === "user") {
-			//todo: handle other message.content types like images
+		if (!isToolResultRequest && lastUserMsg?.role === "user") {
 			userPrompt = Array.isArray(lastUserMsg?.content)
 				? lastUserMsg.content
 						.map((c) => (c.type === "text" ? c.text : ""))
@@ -54,78 +85,172 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 		)?.content;
 
 		return new Observable<BaseEvent>((observer) => {
-			//required
+			// Register this observer as the active one for this thread.
+			// Tool handlers (created once per session) read from this map
+			// so they always emit on the current SSE stream.
+			activeObservers.set(threadId, { observer, runId });
+
 			observer.next({
 				type: EventType.RUN_STARTED,
 				threadId,
 				runId,
 			});
 
-			let currentSession: CopilotSession | null = null;
-			let cleanup: () => void;
+			let cleanup: (() => void) | undefined;
 
-			const onIdle = () => {
-				// required
-				observer.next({
-					type: EventType.RUN_FINISHED,
+			if (isToolResultRequest) {
+				const toolCallId = lastUserMsg.toolCallId;
+				const toolResult = lastUserMsg.content;
+				const pending = pendingToolCalls.get(toolCallId);
+				const cachedSession = sessionCache.get(threadId);
+
+				if (!pending || !cachedSession) {
+					// Fallback: no pending call or no session — send as prompt
+					console.warn(
+						`No pending tool call or session for toolCallId: ${toolCallId}. ` +
+							`Falling back to sending result as prompt.`,
+					);
+					const fallbackPrompt = `Tool results with toolCallId ${toolCallId} with result: ${toolResult}`;
+					const executeFallback = async () => {
+						try {
+							const session = await this.getSession({
+								threadId,
+								systemMessage,
+								tools,
+							});
+							this.subscribeToSession(
+								session,
+								observer,
+								threadId,
+								runId,
+								(fn) => {
+									cleanup = fn;
+								},
+							);
+							await session.send({ prompt: fallbackPrompt });
+						} catch (error: unknown) {
+							this.emitError(observer, threadId, runId, error);
+						}
+					};
+					executeFallback();
+					return () => {
+						cleanup?.();
+					};
+				}
+
+				// IMPORTANT: Subscribe to session events BEFORE resolving the
+				// pending promise to avoid a race where the SDK unblocks,
+				// the LLM finishes, and session.idle fires before we listen.
+				this.subscribeToSession(
+					cachedSession,
+					observer,
 					threadId,
 					runId,
-				});
-				observer.complete();
-			};
+					(fn) => {
+						cleanup = fn;
+					},
+				);
 
+				// Now resolve — unblocks the SDK tool handler
+				console.log(
+					`Resolving pending tool call ${toolCallId} with client result`,
+				);
+				pending.resolve(toolResult);
+				pendingToolCalls.delete(toolCallId);
+
+				return () => {
+					cleanup?.();
+				};
+			}
+
+			// Normal flow: user message — create/resume session and send prompt
 			const execute = async () => {
 				try {
-					// Pass tools to getSession
-					currentSession = await this.getSession({
+					const currentSession = await this.getSession({
 						threadId,
 						systemMessage,
 						tools,
-						observer,
 					});
 
-					const unsubDeltaEvent = currentSession.on(
-						"assistant.message_delta",
-						(event) => {
-							const message = {
-								type: EventType.TEXT_MESSAGE_CHUNK,
-								messageId: event.data.messageId,
-								delta: event.data.deltaContent,
-								role: "assistant",
-							} satisfies TextMessageChunkEvent;
-							observer.next(message);
+					this.subscribeToSession(
+						currentSession,
+						observer,
+						threadId,
+						runId,
+						(fn) => {
+							cleanup = fn;
 						},
 					);
 
-					const unsubIdleListener = currentSession.on("session.idle", onIdle);
-
-					cleanup = () => {
-						unsubDeltaEvent();
-						unsubIdleListener();
-					};
-
 					await currentSession.send({
-						prompt: userPrompt || "user prompt missing.using default",
+						prompt: userPrompt || "user prompt missing. using default",
 					});
 				} catch (error: unknown) {
-					console.log("Error during agent run execution:", error);
-					const errorMessage =
-						error instanceof Error ? error.message : "Unknown error";
-					observer.error({
-						type: EventType.RUN_ERROR,
-						threadId,
-						runId,
-						message: errorMessage,
-					} as RunErrorEvent);
+					this.emitError(observer, threadId, runId, error);
 				}
 			};
 
 			execute();
 			return () => {
 				cleanup?.();
-				this.destroySession().catch(console.error);
 			};
 		});
+	}
+
+	/**
+	 * Subscribe to assistant.message_delta and session.idle on a session,
+	 * forwarding events to the AG-UI observer.
+	 */
+	private subscribeToSession(
+		session: CopilotSession,
+		observer: Observer<BaseEvent>,
+		threadId: string,
+		runId: string,
+		setCleanup: (fn: () => void) => void,
+	) {
+		const unsubDelta = session.on("assistant.message_delta", (event) => {
+			observer.next({
+				type: EventType.TEXT_MESSAGE_CHUNK,
+				messageId: event.data.messageId,
+				delta: event.data.deltaContent,
+				role: "assistant",
+			} satisfies TextMessageChunkEvent);
+		});
+
+		const unsubIdle = session.on("session.idle", () => {
+			observer.next({
+				type: EventType.RUN_FINISHED,
+				threadId,
+				runId,
+			});
+			observer.complete();
+			// Clean up listeners after completing so they don't fire
+			// on subsequent turns of the same session
+			unsubDelta();
+			unsubIdle();
+		});
+
+		setCleanup(() => {
+			unsubDelta();
+			unsubIdle();
+		});
+	}
+
+	private emitError(
+		observer: Observer<BaseEvent>,
+		threadId: string,
+		runId: string,
+		error: unknown,
+	) {
+		console.log("Error during agent run execution:", error);
+		const errorMessage =
+			error instanceof Error ? error.message : "Unknown error";
+		observer.error({
+			type: EventType.RUN_ERROR,
+			threadId,
+			runId,
+			message: errorMessage,
+		} as RunErrorEvent);
 	}
 
 	private async getSession({
@@ -133,48 +258,80 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 		model,
 		systemMessage = "You are a helpful assistant",
 		tools = [],
-		observer,
 	}: {
 		threadId: string;
 		model?: string;
 		systemMessage?: string;
 		tools?: Tool[];
-		observer: Observer<BaseEvent>;
 	}): Promise<CopilotSession> {
-		if (this.session?.sessionId === threadId) {
-			return this.session;
+		// Return cached session if it already exists for this thread
+		const cached = sessionCache.get(threadId);
+		if (cached) {
+			return cached;
 		}
 
-		// ensure client connection
+		// Ensure client connection
 		if (client.getState() === "disconnected") await client.start();
 
-		// Map AG-UI tools to Copilot SDK tools
+		// Map AG-UI tools to Copilot SDK tools with blocking handlers
 		const sdkTools = tools.map((tool) =>
 			defineTool(tool.name, {
 				description: tool.description,
 				parameters: tool.parameters,
 				handler: async (args, invocation) => {
-					observer.next({
+					// Read the currently-active observer for this thread.
+					// This ensures we always emit on the correct SSE stream,
+					// even though this handler was created during an earlier request.
+					const active = activeObservers.get(threadId);
+					if (!active) {
+						console.warn(
+							`No active observer for thread ${threadId} during tool call ${invocation.toolCallId}`,
+						);
+						return "Error: no active client connection";
+					}
+
+					const { observer: currentObserver, runId: currentRunId } = active;
+
+					// 1. Emit TOOL_CALL_CHUNK to notify client of the tool call
+					currentObserver.next({
 						type: EventType.TOOL_CALL_CHUNK,
 						toolCallId: invocation.toolCallId,
 						toolCallName: invocation.toolName,
 						delta: JSON.stringify(args),
 					} as ToolCallChunkEvent);
 
-					return {
-						__agui_tool_call_id: invocation.toolCallId,
-						__agui_status: "PENDING_CLIENT_EXECUTION",
-						message: "Tool call dispatched to client for execution",
-					};
+					// 2. Signal to the client that this run is finished and
+					//    it should execute the tool and send results back
+					currentObserver.next({
+						type: EventType.RUN_FINISHED,
+						threadId,
+						runId: currentRunId,
+					});
+					currentObserver.complete();
+
+					// 3. Block the SDK by returning a Promise that won't resolve
+					//    until the client sends tool results in a new request
+					console.log(
+						`Tool ${invocation.toolName} (${invocation.toolCallId}) dispatched to client. Waiting for result...`,
+					);
+
+					const result = await new Promise<string>((resolve) => {
+						pendingToolCalls.set(invocation.toolCallId, { resolve });
+					});
+
+					console.log(
+						`Tool ${invocation.toolName} (${invocation.toolCallId}) received result from client.`,
+					);
+
+					// 4. Return the real tool result to the Copilot SDK
+					//    so the LLM can continue with actual data
+					return result;
 				},
 			}),
 		);
 
-		// Extract common session config for deduplication
 		const commonConfig = {
 			model: model || "gpt-4.1",
-			// model: model || "gpt-5-mini",
-			// reasoningEffort: "medium",
 			streaming: true,
 			sessionId: threadId,
 			availableTools: [...sdkTools.map((t) => t.name), "web_fetch", "ask_user"],
@@ -200,27 +357,20 @@ export class HumanInTheLoopAgent extends AbstractAgent {
 		const sessions = await this.client.listSessions();
 		const existingSession = sessions.find((s) => s.sessionId === threadId);
 
-		// resume existing session if found
+		let session: CopilotSession;
 
 		if (existingSession) {
-			this.session = await this.client.resumeSession(threadId, {
+			session = await this.client.resumeSession(threadId, {
 				...commonConfig,
 			});
-			return this.session;
+		} else {
+			session = await this.client.createSession({
+				...commonConfig,
+			});
 		}
 
-		this.session = await this.client.createSession({
-			...commonConfig,
-		});
-
-		return this.session;
-	}
-
-	private async destroySession() {
-		if (this.session) {
-			await this.session.abort();
-			this.session.destroy();
-			this.session = null;
-		}
+		// Cache the session at module level so it survives across requests
+		sessionCache.set(threadId, session);
+		return session;
 	}
 }
