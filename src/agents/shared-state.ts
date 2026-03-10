@@ -8,7 +8,7 @@ import {
     ToolCallChunkEvent,
     Tool,
 } from "@ag-ui/client";
-import { Observable, Observer } from "rxjs";
+import { Observable } from "rxjs";
 import { client } from "../copilot-sdk.js";
 import jsonpatch from "fast-json-patch";
 import {
@@ -17,37 +17,41 @@ import {
     type CopilotClient,
     type CopilotSession,
 } from "@github/copilot-sdk";
+import {
+    setActiveObserver,
+    getActiveObserver,
+    getCachedSession,
+    getOrCreateSession,
+    subscribeToSession,
+    mapToolsToSdk,
+    resolvePendingToolCall,
+    hasPendingToolCall,
+} from "./session-manager.js";
 
 type RunAgent = Observable<BaseEvent>;
 
 /**
- * Module-level map of pending tool calls.
- * Key: toolCallId
- * Value: { resolve } to unblock the Copilot SDK tool handler when the client
- *        sends back the tool result in a subsequent HTTP request.
+ * Per-thread local state map.
+ * Replaces the old closure-captured `localState` that was only set once on session
+ * creation and never refreshed with subsequent request state.
+ * Now updated on EVERY request so the LLM hooks always see fresh state.
  */
-const pendingToolCalls = new Map<
-    string,
-    { resolve: (result: string) => void }
->();
+const threadLocalState = new Map<string, Record<string, unknown>>();
 
 /**
- * Module-level session cache keyed by threadId.
- * Keeps the CopilotSession alive across requests so the blocked tool handler
- * Promise can be resolved by a later request.
+ * Clean up local state for a specific thread.
+ * Called when a session is destroyed.
  */
-const sessionCache = new Map<string, CopilotSession>();
+export function clearThreadLocalState(threadId: string): void {
+    threadLocalState.delete(threadId);
+}
 
 /**
- * Module-level mutable reference to the current observer + runId for each thread.
- * Updated on every request so that tool handlers (which are created once per session
- * but may fire across multiple requests) always emit events on the correct,
- * currently-active SSE stream.
+ * Clean up all local state. Called on shutdown or bulk session clear.
  */
-const activeObservers = new Map<
-    string,
-    { observer: Observer<BaseEvent>; runId: string }
->();
+export function clearAllThreadLocalState(): void {
+    threadLocalState.clear();
+}
 
 export class SharedStateAgent extends AbstractAgent {
     client: CopilotClient;
@@ -61,6 +65,12 @@ export class SharedStateAgent extends AbstractAgent {
         const { threadId, runId, messages, tools, state, context } = input;
         console.log("Ai shared state", state);
         console.log("Ai shared app context", context);
+
+        if (state && typeof state === "object") {
+            threadLocalState.set(threadId, state as Record<string, unknown>);
+        } else if (!threadLocalState.has(threadId)) {
+            threadLocalState.set(threadId, {});
+        }
 
         const lastUserMsg = messages.findLast(
             (msg) => msg.role === "user" || msg.role === "tool",
@@ -85,10 +95,8 @@ export class SharedStateAgent extends AbstractAgent {
         console.log("systemMessage", systemMessage);
 
         return new Observable<BaseEvent>((observer) => {
-            // Register this observer as the active one for this thread.
-            // Tool handlers (created once per session) read from this map
-            // so they always emit on the current SSE stream.
-            activeObservers.set(threadId, { observer, runId });
+            // Register this observer, completing the previous one if it exists
+            setActiveObserver(threadId, observer, runId);
 
             observer.next({
                 type: EventType.RUN_STARTED,
@@ -96,15 +104,12 @@ export class SharedStateAgent extends AbstractAgent {
                 runId,
             });
 
-            let cleanup: (() => void) | undefined;
-
             if (isToolResultRequest) {
                 const toolCallId = lastUserMsg.toolCallId;
                 const toolResult = lastUserMsg.content;
-                const pending = pendingToolCalls.get(toolCallId);
-                const cachedSession = sessionCache.get(threadId);
+                const cachedSession = getCachedSession(threadId);
 
-                if (!pending || !cachedSession) {
+                if (!hasPendingToolCall(toolCallId) || !cachedSession) {
                     // Fallback: no pending call or no session — send as prompt
                     console.warn(
                         `No pending tool call or session for toolCallId: ${toolCallId}. ` +
@@ -120,14 +125,11 @@ export class SharedStateAgent extends AbstractAgent {
                                 initialState: state,
                                 context,
                             });
-                            this.subscribeToSession(
+                            subscribeToSession(
                                 session,
-                                observer,
                                 threadId,
                                 runId,
-                                (fn) => {
-                                    cleanup = fn;
-                                },
+                                observer,
                             );
                             await session.send({ prompt: fallbackPrompt });
                         } catch (error: unknown) {
@@ -135,34 +137,18 @@ export class SharedStateAgent extends AbstractAgent {
                         }
                     };
                     executeFallback();
-                    return () => {
-                        cleanup?.();
-                    };
+                    return;
                 }
 
-                // IMPORTANT: Subscribe to session events BEFORE resolving the
-                // pending promise to avoid a race where the SDK unblocks,
-                // the LLM finishes, and session.idle fires before we listen.
-                this.subscribeToSession(
-                    cachedSession,
-                    observer,
-                    threadId,
-                    runId,
-                    (fn) => {
-                        cleanup = fn;
-                    },
-                );
+                // Subscribe BEFORE resolving to avoid race with session.idle
+                subscribeToSession(cachedSession, threadId, runId, observer);
 
-                // Now resolve — unblocks the SDK tool handler
+                // Resolve — unblocks the SDK tool handler
                 console.log(
                     `Resolving pending tool call ${toolCallId} with client result`,
                 );
-                pending.resolve(toolResult);
-                pendingToolCalls.delete(toolCallId);
-
-                return () => {
-                    cleanup?.();
-                };
+                resolvePendingToolCall(toolCallId, toolResult);
+                return;
             }
 
             // Normal flow: user message — create/resume session and send prompt
@@ -176,14 +162,11 @@ export class SharedStateAgent extends AbstractAgent {
                         context,
                     });
 
-                    this.subscribeToSession(
+                    subscribeToSession(
                         currentSession,
-                        observer,
                         threadId,
                         runId,
-                        (fn) => {
-                            cleanup = fn;
-                        },
+                        observer,
                     );
 
                     await currentSession.send({
@@ -196,53 +179,11 @@ export class SharedStateAgent extends AbstractAgent {
             };
 
             execute();
-            return () => {
-                cleanup?.();
-            };
-        });
-    }
-
-    /**
-     * Subscribe to assistant.message_delta and session.idle on a session,
-     * forwarding events to the AG-UI observer.
-     */
-    private subscribeToSession(
-        session: CopilotSession,
-        observer: Observer<BaseEvent>,
-        threadId: string,
-        runId: string,
-        setCleanup: (fn: () => void) => void,
-    ) {
-        const unsubDelta = session.on("assistant.message_delta", (event) => {
-            observer.next({
-                type: EventType.TEXT_MESSAGE_CHUNK,
-                messageId: event.data.messageId,
-                delta: event.data.deltaContent,
-                role: "assistant",
-            } satisfies TextMessageChunkEvent);
-        });
-
-        const unsubIdle = session.on("session.idle", () => {
-            observer.next({
-                type: EventType.RUN_FINISHED,
-                threadId,
-                runId,
-            });
-            observer.complete();
-            // Clean up listeners after completing so they don't fire
-            // on subsequent turns of the same session
-            unsubDelta();
-            unsubIdle();
-        });
-
-        setCleanup(() => {
-            unsubDelta();
-            unsubIdle();
         });
     }
 
     private emitError(
-        observer: Observer<BaseEvent>,
+        observer: import("rxjs").Observer<BaseEvent>,
         threadId: string,
         runId: string,
         error: unknown,
@@ -272,78 +213,9 @@ export class SharedStateAgent extends AbstractAgent {
         tools?: Tool[];
         initialState?: RunAgentInput["state"];
         context?: { value: string; description: string }[];
-    }): Promise<CopilotSession> {
-        // Return cached session if it already exists for this thread
-        const cached = sessionCache.get(threadId);
-        if (cached) {
-            return cached;
-        }
-
-        // Maintain a local reference to state for this run
-        let localState = initialState || {};
-
-        // Ensure client connection
-        if (client.getState() === "disconnected") await client.start();
-
+    }) {
         // Map AG-UI tools to Copilot SDK tools with blocking handlers
-        const sdkTools = tools.map((tool) =>
-            defineTool(tool.name, {
-                description: tool.description,
-                parameters: tool.parameters,
-                handler: async (args, invocation) => {
-                    // Read the currently-active observer for this thread.
-                    // This ensures we always emit on the correct SSE stream,
-                    // even though this handler was created during an earlier request.
-                    const active = activeObservers.get(threadId);
-                    if (!active) {
-                        console.warn(
-                            `No active observer for thread ${threadId} during tool call ${invocation.toolCallId}`,
-                        );
-                        return "Error: no active client connection";
-                    }
-
-                    const { observer: currentObserver, runId: currentRunId } =
-                        active;
-
-                    // 1. Emit TOOL_CALL_CHUNK to notify client of the tool call
-                    currentObserver.next({
-                        type: EventType.TOOL_CALL_CHUNK,
-                        toolCallId: invocation.toolCallId,
-                        toolCallName: invocation.toolName,
-                        delta: JSON.stringify(args),
-                    } as ToolCallChunkEvent);
-
-                    // 2. Signal to the client that this run is finished and
-                    //    it should execute the tool and send results back
-                    currentObserver.next({
-                        type: EventType.RUN_FINISHED,
-                        threadId,
-                        runId: currentRunId,
-                    });
-                    currentObserver.complete();
-
-                    // 3. Block the SDK by returning a Promise that won't resolve
-                    //    until the client sends tool results in a new request
-                    console.log(
-                        `Tool ${invocation.toolName} (${invocation.toolCallId}) dispatched to client. Waiting for result...`,
-                    );
-
-                    const result = await new Promise<string>((resolve) => {
-                        pendingToolCalls.set(invocation.toolCallId, {
-                            resolve,
-                        });
-                    });
-
-                    console.log(
-                        `Tool ${invocation.toolName} (${invocation.toolCallId}) received result from client.`,
-                    );
-
-                    // 4. Return the real tool result to the Copilot SDK
-                    //    so the LLM can continue with actual data
-                    return result;
-                },
-            }),
-        );
+        const sdkTools = mapToolsToSdk(tools || [], threadId);
 
         // Define state tool with JSON Patch (RFC 6902) format
         const stateToolDefinition = {
@@ -394,7 +266,7 @@ export class SharedStateAgent extends AbstractAgent {
                 // The update_state tool is server-side only (doesn't go to client),
                 // so we handle it synchronously and return the result immediately.
                 // We still need to get the active observer to emit STATE_DELTA events.
-                const active = activeObservers.get(threadId);
+                const active = getActiveObserver(threadId);
                 if (!active) {
                     console.warn(
                         `No active observer for thread ${threadId} during update_state`,
@@ -451,6 +323,9 @@ export class SharedStateAgent extends AbstractAgent {
 
                     console.log("Applying JSON Patch operations:", operations);
 
+                    // Read the current state from threadLocalState (always fresh)
+                    let localState = threadLocalState.get(threadId) || {};
+
                     // Apply patches directly to local state
                     const result = jsonpatch.applyPatch(
                         localState,
@@ -459,6 +334,9 @@ export class SharedStateAgent extends AbstractAgent {
                         false,
                     );
                     localState = result.newDocument;
+
+                    // Write back to the thread-local state map
+                    threadLocalState.set(threadId, localState);
 
                     // Forward the operations as the delta to the frontend
                     currentObserver.next({
@@ -505,11 +383,11 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
 `;
 
         const commonConfig = {
-            // model: model || "gpt-5-mini",
-            model: model || "gpt-4.1",
+            model: model || "gpt-5-mini",
+            // model: model || "gpt-4o",
             streaming: true,
             sessionId: threadId,
-            // reasoningEffort: "medium",
+            reasoningEffort: "low",
             availableTools: [
                 ...sdkTools.map((t) => t.name),
                 "web_fetch",
@@ -532,7 +410,9 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
                         suppressOutput: true,
                     };
                 },
-                onUserPromptSubmitted: async (input) => {
+                onUserPromptSubmitted: async (input: { prompt: string }) => {
+                    // Read from threadLocalState (always up-to-date)
+                    const localState = threadLocalState.get(threadId) || {};
                     const appContext = `\n\n<ApplicationContext>:\n${JSON.stringify(localState, null, 2)}\n</ApplicationContext>  \n\n`;
 
                     const contextSection =
@@ -542,29 +422,12 @@ INCORRECT (wastes tokens - DO NOT DO THIS):
 
                     return {
                         modifiedPrompt: `${input.prompt}${appContext}${contextSection}`,
-                        suppressOutput: true,
+                        suppressOutput: false,
                     };
                 },
             },
         } satisfies Partial<SessionConfig>;
 
-        const sessions = await this.client.listSessions();
-        const existingSession = sessions.find((s) => s.sessionId === threadId);
-
-        let session: CopilotSession;
-
-        if (existingSession) {
-            session = await this.client.resumeSession(threadId, {
-                ...commonConfig,
-            });
-        } else {
-            session = await this.client.createSession({
-                ...commonConfig,
-            });
-        }
-
-        // Cache the session at module level so it survives across requests
-        sessionCache.set(threadId, session);
-        return session;
+        return getOrCreateSession({ threadId, config: commonConfig });
     }
 }
